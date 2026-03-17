@@ -1,0 +1,115 @@
+quarkus:
+  http:
+    port: 8080
+  log:
+    level: INFO
+    category:
+      "se.irori":
+        level: DEBUG
+  datasource:
+    db-kind: postgresql
+    reactive:
+      url: ${QUARKUS_DATASOURCE_REACTIVE_URL:postgresql://postgres:5432/appdb}
+      max-size: 20
+    username: ${QUARKUS_DATASOURCE_USERNAME:postgres}
+    password: ${QUARKUS_DATASOURCE_PASSWORD:postgres}
+  hibernate-orm:
+    database:
+      generation: update
+
+dlqman:
+  kafka:
+    common:
+      "bootstrap.servers": ${KAFKA_BOOTSTRAP_SERVERS:kafka:29092}
+    consumer:
+      "group.id": dlqman
+      "key.deserializer": org.apache.kafka.common.serialization.ByteArrayDeserializer
+      "value.deserializer": org.apache.kafka.common.serialization.ByteArrayDeserializer
+      "auto.offset.reset": earliest
+      "enable.auto.commit": true
+    poll-timeout: 2000
+
+  # ============================================
+  # DLQ Sources - one per connector DLQ topic
+  # ============================================
+  sources:
+    eligibility-dlq:
+      name: eligibility-dlq
+      description: "DLQ for jdbc-sink-eligibility connector (members, coverage, enrollment)"
+      source-topic: dlq-jdbc-sink-eligibility
+      resend-topic: cdc.members
+      match-rules:
+        - name: deserialization-errors
+          priority: 5
+          matcher: is-deserialization-error
+          strategy: dismiss
+        - name: converter-errors
+          priority: 10
+          matcher: is-converter-error
+          strategy: resend-after-delay
+        - name: catch-all
+          priority: 100
+          matcher: all
+          strategy: dismiss
+
+    claims-dlq:
+      name: claims-dlq
+      description: "DLQ for jdbc-sink-claims connector (claims, claim_lines, adjustments)"
+      source-topic: dlq-jdbc-sink-claims
+      resend-topic: cdc.claims
+      match-rules:
+        - name: deserialization-errors
+          priority: 5
+          matcher: is-deserialization-error
+          strategy: dismiss
+        - name: converter-errors
+          priority: 10
+          matcher: is-converter-error
+          strategy: resend-after-delay
+        - name: catch-all
+          priority: 100
+          matcher: all
+          strategy: dismiss
+
+    providers-dlq:
+      name: providers-dlq
+      description: "DLQ for jdbc-sink-providers connector (providers, facilities, networks)"
+      source-topic: dlq-jdbc-sink-providers
+      resend-topic: cdc.providers
+      match-rules:
+        - name: deserialization-errors
+          priority: 5
+          matcher: is-deserialization-error
+          strategy: dismiss
+        - name: converter-errors
+          priority: 10
+          matcher: is-converter-error
+          strategy: resend-after-delay
+        - name: catch-all
+          priority: 100
+          matcher: all
+          strategy: dismiss
+
+  # ============================================
+  # Matchers - match on Kafka Connect error headers
+  # ============================================
+  matchers:
+    - name: is-deserialization-error
+      class-name: HeaderRegexMatcher
+      config:
+        headerName: __connect.errors.exception.class.name
+        regexPattern: ".*[Dd]eserializ.*"
+    - name: is-converter-error
+      class-name: HeaderRegexMatcher
+      config:
+        headerName: __connect.errors.exception.class.name
+        regexPattern: ".*[Cc]onvert.*"
+
+  # ============================================
+  # DLQ Strategies
+  # ============================================
+  dlq-strategies:
+    - name: resend-after-delay
+      class-name: SimpleResendDLQStrategy
+      config:
+        nextWaitDuration: 15000

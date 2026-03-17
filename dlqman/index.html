@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DLQman - Dead Letter Queue Browser</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0}
+    .hdr{background:#1e293b;border-bottom:1px solid #334155;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between}
+    .hdr h1{font-size:1.25rem;font-weight:600;color:#f8fafc}
+    .hdr h1 span{color:#38bdf8}
+    .hdr small{font-size:.75rem;color:#64748b}
+    .wrap{max-width:1400px;margin:0 auto;padding:1.5rem 2rem}
+    .stats{display:flex;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}
+    .stat{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:1rem 1.5rem;text-align:center;min-width:130px}
+    .stat .n{font-size:1.75rem;font-weight:700;color:#38bdf8}
+    .stat .l{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-top:.25rem}
+    .bar{display:flex;gap:0;margin-bottom:1.5rem;border-bottom:1px solid #334155}
+    .tab{padding:.75rem 1.5rem;cursor:pointer;color:#94a3b8;font-size:.875rem;border-bottom:2px solid transparent;user-select:none}
+    .tab.on{color:#38bdf8;border-bottom-color:#38bdf8}
+    .tab:hover{color:#e2e8f0}
+    .ctl{display:flex;gap:.75rem;margin-bottom:1rem;align-items:center;flex-wrap:wrap}
+    .ctl select,.ctl input{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:.5rem .75rem;border-radius:6px;font-size:.875rem}
+    .ctl button{background:#2563eb;color:#fff;border:none;padding:.5rem 1rem;border-radius:6px;cursor:pointer;font-size:.875rem;font-weight:500}
+    .ctl button:hover{background:#1d4ed8}
+    table{width:100%;border-collapse:collapse;font-size:.8rem}
+    thead th{background:#1e293b;color:#94a3b8;padding:.75rem;text-align:left;font-weight:500;text-transform:uppercase;letter-spacing:.05em;font-size:.7rem;border-bottom:1px solid #334155;position:sticky;top:0}
+    tbody td{padding:.6rem .75rem;border-bottom:1px solid #1e293b;vertical-align:top}
+    tbody tr:hover{background:#1e293b}
+    .b{display:inline-block;padding:.2rem .5rem;border-radius:4px;font-size:.7rem;font-weight:600}
+    .b-blue{background:#1e3a5f;color:#38bdf8}
+    .b-green{background:#14532d;color:#4ade80}
+    .b-yellow{background:#422006;color:#fbbf24}
+    .mono{font-family:'SF Mono','Fira Code',monospace;font-size:.75rem;color:#94a3b8}
+    .empty{text-align:center;padding:3rem;color:#64748b}
+  </style>
+</head>
+<body>
+  <div class="hdr">
+    <h1><span>DLQman</span> &mdash; Dead Letter Queue Browser</h1>
+    <small id="refresh-note">Auto-refreshes every 10s</small>
+  </div>
+  <div class="wrap">
+    <div class="stats">
+      <div class="stat"><div class="n" id="s-total">&ndash;</div><div class="l">Total Messages</div></div>
+      <div class="stat"><div class="n" id="s-elig">&ndash;</div><div class="l">Eligibility DLQ</div></div>
+      <div class="stat"><div class="n" id="s-claims">&ndash;</div><div class="l">Claims DLQ</div></div>
+      <div class="stat"><div class="n" id="s-prov">&ndash;</div><div class="l">Providers DLQ</div></div>
+    </div>
+    <div class="bar">
+      <div class="tab on" data-v="msg">Messages</div>
+      <div class="tab" data-v="proc">Processes</div>
+      <div class="tab" data-v="health">Health</div>
+    </div>
+    <div id="v-msg">
+      <div class="ctl">
+        <select id="f-src">
+          <option value="">All Sources</option>
+          <option value="eligibility-dlq">eligibility-dlq</option>
+          <option value="claims-dlq">claims-dlq</option>
+          <option value="providers-dlq">providers-dlq</option>
+        </select>
+        <input id="f-topic" type="text" placeholder="Filter by destination topic..." style="width:220px">
+        <button onclick="load()">Refresh</button>
+      </div>
+      <div id="tbl"><div class="empty">Loading messages&hellip;</div></div>
+    </div>
+    <div id="v-proc" style="display:none"><div id="ptbl" class="empty">Loading&hellip;</div></div>
+    <div id="v-health" style="display:none"><pre id="htbl" style="color:#94a3b8;font-size:.85rem"></pre></div>
+  </div>
+<script>
+let msgs=[];
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+  t.classList.add('on');
+  ['msg','proc','health'].forEach(v=>document.getElementById('v-'+v).style.display=v===t.dataset.v?'block':'none');
+  if(t.dataset.v==='proc')loadProc();
+  if(t.dataset.v==='health')loadHealth();
+}));
+document.getElementById('f-src').addEventListener('change',render);
+document.getElementById('f-topic').addEventListener('input',render);
+
+async function load(){
+  try{
+    const r=await fetch('/v1/messages');
+    msgs=await r.json();
+    document.getElementById('s-total').textContent=msgs.length;
+    document.getElementById('s-elig').textContent=msgs.filter(m=>m.sourceId==='eligibility-dlq').length;
+    document.getElementById('s-claims').textContent=msgs.filter(m=>m.sourceId==='claims-dlq').length;
+    document.getElementById('s-prov').textContent=msgs.filter(m=>m.sourceId==='providers-dlq').length;
+    render();
+  }catch(e){document.getElementById('tbl').innerHTML='<div class="empty">Failed to load</div>'}
+}
+
+function render(){
+  const src=document.getElementById('f-src').value;
+  const top=document.getElementById('f-topic').value.toLowerCase();
+  let f=msgs;
+  if(src)f=f.filter(m=>m.sourceId===src);
+  if(top)f=f.filter(m=>(m.destinationTopic||'').toLowerCase().includes(top));
+  if(!f.length){document.getElementById('tbl').innerHTML='<div class="empty">No messages</div>';return}
+  const rows=f.slice(0,500).map(m=>`<tr>
+    <td class="mono">${(m.id||'').substring(0,8)}&hellip;</td>
+    <td><span class="b b-blue">${m.sourceId||''}</span></td>
+    <td class="mono">${m.sourceTopic||''}</td>
+    <td>${m.sourcePartition??''}</td>
+    <td class="mono">${m.sourceOffset??''}</td>
+    <td class="mono">${m.destinationTopic||''}</td>
+    <td>${m.status?'<span class="b b-yellow">'+m.status+'</span>':'<span class="b b-green">INGESTED</span>'}</td>
+    <td class="mono">${m.matchedRule||'&mdash;'}</td></tr>`).join('');
+  document.getElementById('tbl').innerHTML=`<table><thead><tr>
+    <th>ID</th><th>Source</th><th>Source Topic</th><th>Part</th><th>Offset</th><th>Dest Topic</th><th>Status</th><th>Rule</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <div style="margin-top:.75rem;font-size:.75rem;color:#64748b">Showing ${Math.min(f.length,500)} of ${f.length}</div>`;
+}
+
+async function loadProc(){
+  try{
+    const r=await fetch('/v1/processes');
+    const p=await r.json();
+    if(!p.length){document.getElementById('ptbl').innerHTML='<div class="empty">No processes</div>';return}
+    const rows=p.map(x=>`<tr>
+      <td class="mono">${(x.id||'').substring(0,8)}&hellip;</td>
+      <td>${x.sourceId||''}</td>
+      <td><span class="b b-green">${x.state||'RUNNING'}</span></td></tr>`).join('');
+    document.getElementById('ptbl').innerHTML=`<table><thead><tr><th>ID</th><th>Source</th><th>State</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }catch(e){document.getElementById('ptbl').innerHTML='<div class="empty">Failed to load processes</div>'}
+}
+
+async function loadHealth(){
+  try{
+    const r=await fetch('/q/health');
+    const d=await r.json();
+    document.getElementById('htbl').textContent=JSON.stringify(d,null,2);
+  }catch(e){document.getElementById('htbl').textContent='Failed to load health'}
+}
+
+load();
+setInterval(load,10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,202 @@
+services:
+  # ============================================
+  # Kafka Broker (KRaft - no ZooKeeper)
+  # ============================================
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server kafka:29092
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ============================================
+  # Schema Registry
+  # ============================================
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: curl -f http://localhost:8081/ || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ============================================
+  # PostgreSQL
+  # ============================================
+  postgres:
+    image: postgres:18
+    hostname: postgres
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: appdb
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./postgres/02-dlqman-schema.sh:/docker-entrypoint-initdb.d/02-dlqman-schema.sh
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: pg_isready -U postgres -d appdb
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ============================================
+  # Kafka Connect (single worker, 3 connector instances)
+  # ============================================
+  kafka-connect:
+    build:
+      context: ./kafka-connect
+      dockerfile: Dockerfile
+    hostname: kafka-connect
+    container_name: kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: 'kafka:29092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: connect-cluster
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 10000
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+    healthcheck:
+      test: curl -f http://localhost:8083/ || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ============================================
+  # Connector Registration (runs once then exits)
+  # ============================================
+  connector-init:
+    image: curlimages/curl:latest
+    container_name: connector-init
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+    volumes:
+      - ./kafka-connect/register-connectors.sh:/opt/register-connectors.sh
+    entrypoint: ["/bin/sh", "/opt/register-connectors.sh"]
+    restart: "no"
+
+  # ============================================
+  # Error Simulator
+  # ============================================
+  error-simulator:
+    build:
+      context: ./error-simulator
+      dockerfile: Dockerfile
+    container_name: error-simulator
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      BATCH_SIZE: "20"
+      ERROR_RATE: "0.3"
+      INTERVAL_MS: "5000"
+
+  # ============================================
+  # Replay Service (Spring Boot)
+  # ============================================
+  replay-service:
+    build:
+      context: ./replay-service
+      dockerfile: Dockerfile
+    hostname: replay-service
+    container_name: replay-service
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8085:8085"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/appdb
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SERVER_PORT: 8085
+
+  # ============================================
+  # DLQman (OOB DLQ Management UI)
+  # ============================================
+  dlqman:
+    build:
+      context: ./dlqman
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    hostname: dlqman
+    container_name: dlqman
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      QUARKUS_DATASOURCE_REACTIVE_URL: postgresql://postgres:5432/dlqman
+      QUARKUS_DATASOURCE_USERNAME: postgres
+      QUARKUS_DATASOURCE_PASSWORD: postgres
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+
+volumes:
+  postgres-data:
