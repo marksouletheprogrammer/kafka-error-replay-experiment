@@ -1,0 +1,443 @@
+{
+	"info": {
+		"_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		"name": "CDC DLQ Replay Service",
+		"description": "API collection for the CDC DLQ/Replay Prototype's Replay Service (port 8085).\n\nEndpoints for listing, filtering, replaying, and abandoning DLQ error records, plus statistics.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8085",
+			"type": "string"
+		},
+		{
+			"key": "errorId",
+			"value": "replace-with-uuid",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Errors",
+			"description": "Endpoints for listing and retrieving error records.",
+			"item": [
+				{
+					"name": "List All Errors",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors"]
+						},
+						"description": "Returns all error records from the metadata store."
+					}
+				},
+				{
+					"name": "List Errors by Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors?status=PENDING",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors"],
+							"query": [
+								{
+									"key": "status",
+									"value": "PENDING",
+									"description": "Filter by status: PENDING, REPLAYING, RESOLVED, ABANDONED"
+								}
+							]
+						},
+						"description": "Returns error records filtered by status."
+					}
+				},
+				{
+					"name": "List Errors by Connector",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors?connector=jdbc-sink-eligibility",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors"],
+							"query": [
+								{
+									"key": "connector",
+									"value": "jdbc-sink-eligibility",
+									"description": "Filter by connector name: jdbc-sink-eligibility, jdbc-sink-claims, jdbc-sink-providers"
+								}
+							]
+						},
+						"description": "Returns error records filtered by connector name."
+					}
+				},
+				{
+					"name": "List Errors by Topic",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors?topic=cdc.members",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors"],
+							"query": [
+								{
+									"key": "topic",
+									"value": "cdc.members",
+									"description": "Filter by original topic name"
+								}
+							]
+						},
+						"description": "Returns error records filtered by original topic."
+					}
+				},
+				{
+					"name": "List Errors by Status + Connector",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors?status=PENDING&connector=jdbc-sink-claims",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors"],
+							"query": [
+								{
+									"key": "status",
+									"value": "PENDING"
+								},
+								{
+									"key": "connector",
+									"value": "jdbc-sink-claims"
+								}
+							]
+						},
+						"description": "Returns error records filtered by both status and connector."
+					}
+				},
+				{
+					"name": "List Errors by Status + Topic",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors?status=PENDING&topic=cdc.claims",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors"],
+							"query": [
+								{
+									"key": "status",
+									"value": "PENDING"
+								},
+								{
+									"key": "topic",
+									"value": "cdc.claims"
+								}
+							]
+						},
+						"description": "Returns error records filtered by both status and topic."
+					}
+				},
+				{
+					"name": "Get Error by ID",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/{{errorId}}",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "{{errorId}}"]
+						},
+						"description": "Returns a single error record by UUID. Set the `errorId` collection variable first."
+					}
+				},
+				{
+					"name": "Get Statistics",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/stats",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "stats"]
+						},
+						"description": "Returns summary counts grouped by status, error code, and connector, plus total count."
+					}
+				}
+			]
+		},
+		{
+			"name": "Replay",
+			"description": "Endpoints for replaying error records back through the pipeline.",
+			"item": [
+				{
+					"name": "Replay Single (re-produce)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/{{errorId}}/replay?mode=re-produce",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "{{errorId}}", "replay"],
+							"query": [
+								{
+									"key": "mode",
+									"value": "re-produce",
+									"description": "Replay mode: re-produce (send back to original Kafka topic)"
+								}
+							]
+						},
+						"description": "Replays a single error record by re-producing it to the original Kafka topic. Set the `errorId` collection variable first."
+					}
+				},
+				{
+					"name": "Replay Single (direct-to-db)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/{{errorId}}/replay?mode=direct-to-db",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "{{errorId}}", "replay"],
+							"query": [
+								{
+									"key": "mode",
+									"value": "direct-to-db",
+									"description": "Replay mode: direct-to-db (write directly to PostgreSQL, placeholder in prototype)"
+								}
+							]
+						},
+						"description": "Replays a single error record via direct database write (placeholder mode). Set the `errorId` collection variable first."
+					}
+				},
+				{
+					"name": "Bulk Replay (all PENDING)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/replay?status=PENDING&mode=re-produce",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "replay"],
+							"query": [
+								{
+									"key": "status",
+									"value": "PENDING",
+									"description": "Filter by status (default: PENDING)"
+								},
+								{
+									"key": "mode",
+									"value": "re-produce",
+									"description": "Replay mode: re-produce or direct-to-db"
+								}
+							]
+						},
+						"description": "Bulk replays all error records matching the given status."
+					}
+				},
+				{
+					"name": "Bulk Replay (by Connector)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/replay?connector=jdbc-sink-claims&mode=re-produce",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "replay"],
+							"query": [
+								{
+									"key": "connector",
+									"value": "jdbc-sink-claims",
+									"description": "Filter by connector name"
+								},
+								{
+									"key": "mode",
+									"value": "re-produce"
+								}
+							]
+						},
+						"description": "Bulk replays all PENDING error records for a specific connector."
+					}
+				},
+				{
+					"name": "Bulk Replay (by Topic)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/replay?topic=cdc.members&mode=re-produce",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "replay"],
+							"query": [
+								{
+									"key": "topic",
+									"value": "cdc.members",
+									"description": "Filter by original topic"
+								},
+								{
+									"key": "mode",
+									"value": "re-produce"
+								}
+							]
+						},
+						"description": "Bulk replays all PENDING error records for a specific topic."
+					}
+				}
+			]
+		},
+		{
+			"name": "Lifecycle",
+			"description": "Endpoints for managing error record lifecycle.",
+			"item": [
+				{
+					"name": "Abandon Error",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/errors/{{errorId}}/abandon",
+							"host": ["{{baseUrl}}"],
+							"path": ["errors", "{{errorId}}", "abandon"]
+						},
+						"description": "Marks an error record as ABANDONED. Set the `errorId` collection variable first."
+					}
+				}
+			]
+		},
+		{
+			"name": "DLQman",
+			"description": "Endpoints for the DLQman OOB DLQ processor (port 8080).",
+			"item": [
+				{
+					"name": "List DLQman Messages",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8080/v1/messages",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8080",
+							"path": ["v1", "messages"]
+						},
+						"description": "Lists all DLQ messages captured by DLQman."
+					}
+				},
+				{
+					"name": "List DLQman Processes",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8080/v1/processes",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8080",
+							"path": ["v1", "processes"]
+						},
+						"description": "Lists active DLQman ingester processes (one per DLQ source)."
+					}
+				},
+				{
+					"name": "DLQman Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8080/q/health",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8080",
+							"path": ["q", "health"]
+						},
+						"description": "Quarkus health check endpoint."
+					}
+				}
+			]
+		},
+		{
+			"name": "Infrastructure",
+			"description": "Kafka Connect and Schema Registry management endpoints.",
+			"item": [
+				{
+					"name": "List Connectors",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8083/connectors",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8083",
+							"path": ["connectors"]
+						},
+						"description": "Lists all registered Kafka Connect connectors."
+					}
+				},
+				{
+					"name": "Get Connector Status (Eligibility)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8083/connectors/jdbc-sink-eligibility/status",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8083",
+							"path": ["connectors", "jdbc-sink-eligibility", "status"]
+						},
+						"description": "Gets the status of the eligibility JDBC sink connector."
+					}
+				},
+				{
+					"name": "Get Connector Status (Claims)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8083/connectors/jdbc-sink-claims/status",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8083",
+							"path": ["connectors", "jdbc-sink-claims", "status"]
+						},
+						"description": "Gets the status of the claims JDBC sink connector."
+					}
+				},
+				{
+					"name": "Get Connector Status (Providers)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8083/connectors/jdbc-sink-providers/status",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8083",
+							"path": ["connectors", "jdbc-sink-providers", "status"]
+						},
+						"description": "Gets the status of the providers JDBC sink connector."
+					}
+				},
+				{
+					"name": "List Schema Registry Subjects",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "http://localhost:8081/subjects",
+							"protocol": "http",
+							"host": ["localhost"],
+							"port": "8081",
+							"path": ["subjects"]
+						},
+						"description": "Lists all registered Avro schema subjects."
+					}
+				}
+			]
+		}
+	]
+}
