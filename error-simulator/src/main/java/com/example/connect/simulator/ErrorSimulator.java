@@ -6,7 +6,6 @@ import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.producer.*;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
-import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,6 +28,7 @@ public class ErrorSimulator {
     private static final int BATCH_SIZE = Integer.parseInt(System.getenv().getOrDefault("BATCH_SIZE", "20"));
     private static final double ERROR_RATE = Double.parseDouble(System.getenv().getOrDefault("ERROR_RATE", "0.3"));
     private static final long INTERVAL_MS = Long.parseLong(System.getenv().getOrDefault("INTERVAL_MS", "5000"));
+    private static final String ENVELOPE_FORMAT = System.getenv().getOrDefault("ENVELOPE_FORMAT", "flat");
 
     // Topic definitions grouped by connector
     private static final Map<String, List<String>> CONNECTOR_TOPICS = Map.of(
@@ -149,26 +149,34 @@ public class ErrorSimulator {
         log.info("Bootstrap Servers: {}", BOOTSTRAP_SERVERS);
         log.info("Schema Registry: {}", SCHEMA_REGISTRY_URL);
         log.info("Batch Size: {}, Error Rate: {}, Interval: {}ms", BATCH_SIZE, ERROR_RATE, INTERVAL_MS);
+        log.info("Envelope Format: {}", ENVELOPE_FORMAT);
 
         // Wait for Schema Registry to be available
         waitForSchemaRegistry();
 
-        // Avro producer for valid records
-        Properties avroProps = new Properties();
-        avroProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
-        avroProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        avroProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
-        avroProps.put("schema.registry.url", SCHEMA_REGISTRY_URL);
-        avroProps.put("auto.register.schemas", "true");
+        // Initialize envelope strategy
+        EnvelopeStrategy strategy = createStrategy(ENVELOPE_FORMAT);
+        strategy.initialize(SCHEMAS);
 
-        // Raw bytes producer for bad records (triggers deserialization errors)
+        // All strategies emit Avro keys; only the value differs (good = Avro, bad = raw garbage bytes).
+        Properties goodProps = new Properties();
+        goodProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
+        goodProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
+        goodProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
+        goodProps.put("schema.registry.url", SCHEMA_REGISTRY_URL);
+        goodProps.put("auto.register.schemas", "true");
+
+        // Raw bytes producer for bad records (triggers deserialization errors on the VALUE only).
+        // Same Avro key serializer as the good producer so keys stay consistent on the topic.
         Properties rawProps = new Properties();
         rawProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
-        rawProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        rawProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
         rawProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        rawProps.put("schema.registry.url", SCHEMA_REGISTRY_URL);
+        rawProps.put("auto.register.schemas", "true");
 
-        try (KafkaProducer<String, GenericRecord> avroProducer = new KafkaProducer<>(avroProps);
-             KafkaProducer<String, byte[]> rawProducer = new KafkaProducer<>(rawProps)) {
+        try (KafkaProducer<Object, Object> goodProducer = new KafkaProducer<>(goodProps);
+             KafkaProducer<Object, byte[]> rawProducer = new KafkaProducer<>(rawProps)) {
 
             List<String> allTopics = CONNECTOR_TOPICS.values().stream()
                 .flatMap(Collection::stream)
@@ -180,12 +188,12 @@ public class ErrorSimulator {
                     boolean shouldFail = ThreadLocalRandom.current().nextDouble() < ERROR_RATE;
 
                     if (shouldFail) {
-                        sendBadRecord(rawProducer, topic);
+                        sendBadRecord(rawProducer, topic, strategy);
                     } else {
-                        sendGoodRecord(avroProducer, topic);
+                        sendGoodRecord(goodProducer, topic, strategy);
                     }
                 }
-                log.info("Sent batch of {} messages (error rate: {})", BATCH_SIZE, ERROR_RATE);
+                log.info("Sent batch of {} messages (error rate: {}, format: {})", BATCH_SIZE, ERROR_RATE, ENVELOPE_FORMAT);
                 Thread.sleep(INTERVAL_MS);
             }
         }
@@ -214,12 +222,12 @@ public class ErrorSimulator {
         log.warn("Schema Registry not available after retries, proceeding anyway.");
     }
 
-    private static void sendGoodRecord(KafkaProducer<String, GenericRecord> producer, String topic) {
+    private static void sendGoodRecord(KafkaProducer<Object, Object> producer, String topic, EnvelopeStrategy strategy) {
         Schema schema = SCHEMAS.get(topic);
         GenericRecord record = generateRecord(topic, schema);
-        String key = String.valueOf(record.get("id"));
+        ProducerRecord<Object, Object> producerRecord = strategy.createRecord(topic, record);
 
-        producer.send(new ProducerRecord<>(topic, key, record), (metadata, exception) -> {
+        producer.send(producerRecord, (metadata, exception) -> {
             if (exception != null) {
                 log.error("Failed to send valid record to {}: {}", topic, exception.getMessage());
             } else {
@@ -228,14 +236,17 @@ public class ErrorSimulator {
         });
     }
 
-    private static void sendBadRecord(KafkaProducer<String, byte[]> producer, String topic) {
+    private static void sendBadRecord(KafkaProducer<Object, byte[]> producer, String topic, EnvelopeStrategy strategy) {
         // Send garbage bytes that cannot be deserialized as Avro
         byte[] garbage = new byte[ThreadLocalRandom.current().nextInt(10, 100)];
         ThreadLocalRandom.current().nextBytes(garbage);
         // Ensure it's not accidentally valid Avro by prepending invalid magic byte
         garbage[0] = (byte) 0xFF;
 
-        String key = "bad-" + ThreadLocalRandom.current().nextInt(10000);
+        // Build a valid key via the active strategy so key serialization stays consistent
+        // with good records on this topic. Only the VALUE is malformed.
+        long id = ThreadLocalRandom.current().nextLong(1, 100000);
+        Object key = strategy.buildKey(topic, id);
 
         producer.send(new ProducerRecord<>(topic, key, garbage), (metadata, exception) -> {
             if (exception != null) {
@@ -244,6 +255,14 @@ public class ErrorSimulator {
                 log.info("Sent BAD record to {}[{}]@{} (will trigger DLQ)", metadata.topic(), metadata.partition(), metadata.offset());
             }
         });
+    }
+
+    private static EnvelopeStrategy createStrategy(String format) {
+        return switch (format.toLowerCase()) {
+            case "debezium" -> new DebeziumEnvelopeStrategy();
+            case "goldengate" -> new GoldenGateEnvelopeStrategy();
+            default -> new FlatEnvelopeStrategy();
+        };
     }
 
     private static GenericRecord generateRecord(String topic, Schema schema) {
