@@ -332,10 +332,7 @@ public class ErrorSimulator {
      * downstream reason (e.g. DB outage, foreign-key lag) rather than a deserialization
      * failure.
      *
-     * <p>The headers attached are exactly the subset of {@code __connect.errors.*}
-     * headers that {@link com.medica.connect.smt.ReplayHeaderToTopic} (configured on
-     * {@code jdbc-sink-replay}) reads to reroute the record back to its original
-     * destination table:
+     * <p>The headers attached are exactly the subset of standard debezium error headers. </p>
      * <ul>
      *   <li>{@code __connect.errors.topic} &mdash; the original {@code cdc.<table>}
      *       source topic. Used by the SMT to compute the destination as
