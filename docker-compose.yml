@@ -84,6 +84,8 @@ services:
     build:
       context: ./kafka-connect
       dockerfile: Dockerfile
+      additional_contexts:
+        custom-smt: ./custom-smt
     hostname: kafka-connect
     container_name: kafka-connect
     depends_on:
@@ -129,6 +131,7 @@ services:
         condition: service_healthy
     volumes:
       - ./kafka-connect/register-connectors.sh:/opt/register-connectors.sh
+      - ./kafka-connect/connectors:/opt/connectors
     entrypoint: ["/bin/sh", "/opt/register-connectors.sh"]
     restart: "no"
 
@@ -149,13 +152,17 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       BATCH_SIZE: "20"
-      ERROR_RATE: "0.3"
+      ERROR_RATE: "0.5"
+      RECOVERABLE_RATE: "0.5"  # of failing records, fraction sent as recoverable Avro to DLQ topics
       INTERVAL_MS: "5000"
+      ENVELOPE_FORMAT: "debezium"  # flat | debezium | goldengate
 
   # ============================================
-  # Replay Service (Spring Boot)
+  # Replay Service (Spring Boot) — opt-in via --profile replay-service
   # ============================================
   replay-service:
+    profiles:
+      - replay-service
     build:
       context: ./replay-service
       dockerfile: Dockerfile
@@ -197,6 +204,34 @@ services:
       QUARKUS_DATASOURCE_USERNAME: postgres
       QUARKUS_DATASOURCE_PASSWORD: postgres
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+
+  # ============================================
+  # Kafka UI (topic browser with header support)
+  # ============================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    hostname: kafka-ui
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kafka-connect:
+        condition: service_healthy
+    ports:
+      - "8084:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      # Use SchemaRegistry serde by default for BOTH keys and values; kafka-ui's built-in
+      # default for keys is String, which renders Avro keys (magic byte + schema id + body)
+      # as garbled UTF-8.
+      KAFKA_CLUSTERS_0_DEFAULTKEYSERDE: SchemaRegistry
+      KAFKA_CLUSTERS_0_DEFAULTVALUESERDE: SchemaRegistry
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect-cluster
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
 
 volumes:
   postgres-data:
