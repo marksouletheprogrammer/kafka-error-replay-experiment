@@ -9,7 +9,7 @@
   "insert.mode": "upsert",
   "primary.key.mode": "record_value",
   "primary.key.fields": "id",
-  "table.name.format": "datastore.${topic}",
+  "collection.name.format": "datastore.${topic}",
   "transforms": "stripPrefix",
   "transforms.stripPrefix.type": "org.apache.kafka.connect.transforms.RegexRouter",
   "transforms.stripPrefix.regex": "cdc\\.(.*)",

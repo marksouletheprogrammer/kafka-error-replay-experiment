@@ -70,6 +70,14 @@ All four sink connectors use the Debezium JDBC sink (`io.debezium.connector.jdbc
 
 `jdbc-sink-replay` is a 4th sink that automatically reprocesses messages landing in the primary DLQs. Records that still fail after this second pass go to `dlq-replay-terminal` for manual inspection.
 
+The simulator emits **three** record classes (see [Configuration & Modes](#configuration--modes) for rates):
+
+| Class | Goes to | Outcome |
+|---|---|---|
+| Good | `cdc.*` | Primary sink upserts into `datastore.*`. |
+| Unrecoverable bad | `cdc.*` (raw garbage bytes) | Primary sink fails → `dlq-jdbc-sink-*` → replay sink also fails → `dlq-replay-terminal`. |
+| Recoverable DLQ | `dlq-jdbc-sink-*` directly, with `__connect.errors.*` headers | Replay sink + `ReplayHeaderToTopic` SMT route it back to `datastore.<table>` and the upsert succeeds. |
+
 Each connector is configured with:
 - `errors.tolerance = all`
 - `errors.deadletterqueue.context.headers.enable = true`
@@ -142,7 +150,8 @@ Most knobs live on `error-simulator` in `docker-compose.yml`:
 | Variable | Default | Notes |
 |---|---|---|
 | `ENVELOPE_FORMAT` | `debezium` | One of `flat`, `debezium`, `goldengate`. Controls the value envelope and key shape. **Only `debezium` round-trips through the JDBC sinks today** — the sinks expect a Debezium envelope. The other two modes are useful for inspecting key/value formats in kafka-ui. |
-| `ERROR_RATE` | `0.3` | Fraction of messages emitted as raw garbage bytes (DLQ-bound). |
+| `ERROR_RATE` | `0.3` | Fraction of messages emitted as failures (DLQ-bound). |
+| `RECOVERABLE_RATE` | `0.1` | Of the failing records (per `ERROR_RATE`), the fraction sent as **recoverable DLQ records** — well-formed Avro published directly to a `dlq-jdbc-sink-*` topic with synthetic Connect error headers. The rest are unrecoverable garbage bytes sent to the source `cdc.*` topics. |
 | `BATCH_SIZE` | `20` | Messages per loop iteration. |
 | `INTERVAL_MS` | `5000` | Milliseconds between batches. |
 
@@ -175,6 +184,59 @@ To stop just the replay-service:
 
 ```bash
 docker compose --profile replay-service stop replay-service
+```
+
+## Observing the Replay Flow
+
+With the default rates, you should see roughly 70% good records, 27% unrecoverable failures, and 3% recoverable replays. To make replays easy to spot, crank the rates:
+
+```bash
+# Edit docker-compose.yml -> error-simulator.environment:
+#   ERROR_RATE: "1.0"        # every record fails
+#   RECOVERABLE_RATE: "1.0"  # ...and every failure is recoverable
+docker compose down -v && docker compose up -d --build
+```
+
+Then:
+
+```bash
+# 1. Watch the simulator log the recoverable sends
+docker compose logs -f error-simulator | grep RECOVERABLE
+
+# 2. Tail kafka-connect for successful replay-sink upserts (no "Unknown magic byte")
+docker compose logs -f kafka-connect | grep -E "jdbc-sink-replay|ERROR"
+
+# 3. Inspect a recoverable DLQ record in kafka-ui (http://localhost:8084)
+#    Browse topic dlq-jdbc-sink-claims and confirm:
+#      - keySerde / valueSerde resolve to SchemaRegistry (key/value are real Avro)
+#      - headers include __connect.errors.topic and __connect.errors.connector.name
+
+# 4. Watch row counts grow in datastore.* as the replay sink writes recovered rows
+watch -n 2 'docker exec postgres psql -U postgres -d appdb -c \
+  "SELECT '"'"'members'"'"' t, count(*) FROM datastore.members
+   UNION ALL SELECT '"'"'claims'"'"', count(*) FROM datastore.claims
+   UNION ALL SELECT '"'"'providers'"'"', count(*) FROM datastore.providers;"'
+
+# 4b. Find ONLY the replayed rows. The simulator stamps recoverable-DLQ records with
+#     an id offset of 9_000_000_000_000, so they're trivially queryable in any table:
+docker exec postgres psql -U postgres -d appdb -c "
+  SELECT 'members'   t, count(*) FROM datastore.members   WHERE id >= 9000000000000
+  UNION ALL SELECT 'claims',    count(*) FROM datastore.claims    WHERE id >= 9000000000000
+  UNION ALL SELECT 'providers', count(*) FROM datastore.providers WHERE id >= 9000000000000;"
+
+# Or look at a few of them directly:
+docker exec postgres psql -U postgres -d appdb -c \
+  "SELECT * FROM datastore.claims WHERE id >= 9000000000000 LIMIT 5;"
+
+# 5. Confirm only truly malformed records reach the terminal DLQ
+docker exec kafka kafka-console-consumer --bootstrap-server kafka:29092 \
+  --topic dlq-replay-terminal --from-beginning --max-messages 3 --timeout-ms 5000
+```
+
+Return to defaults by reverting `ERROR_RATE`/`RECOVERABLE_RATE` in `docker-compose.yml` and recreating the simulator:
+
+```bash
+docker compose up -d --force-recreate error-simulator
 ```
 
 ## Walkthrough

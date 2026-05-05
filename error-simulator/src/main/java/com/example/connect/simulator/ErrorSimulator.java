@@ -5,19 +5,44 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.producer.*;
+import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Produces a mix of valid Avro records and intentionally malformed records
- * to Kafka topics. Valid records are processed normally by the JDBC Sink
- * Connector; malformed records trigger deserialization failures and get
- * routed to the DLQ topics.
+ * Produces a mix of three record classes to demonstrate the full DLQ + replay flow:
+ *
+ * <ol>
+ *   <li><b>Good records</b> &mdash; well-formed Avro records sent to the {@code cdc.*}
+ *       source topics. The primary Debezium JDBC sinks consume these and upsert into
+ *       {@code datastore.*}.</li>
+ *   <li><b>Unrecoverable bad records</b> &mdash; random garbage bytes sent to
+ *       {@code cdc.*}. The primary sinks fail to deserialize them and route them to
+ *       {@code dlq-jdbc-sink-*}. The replay sink fails on them as well and sends them
+ *       to {@code dlq-replay-terminal} (terminal failure, manual triage).</li>
+ *   <li><b>Recoverable DLQ records</b> &mdash; well-formed Avro records published
+ *       <em>directly</em> to a {@code dlq-jdbc-sink-*} topic with synthetic
+ *       {@code __connect.errors.*} headers. These simulate a record that originally
+ *       failed for a transient downstream reason (DB outage, FK lag, etc.). The
+ *       {@code jdbc-sink-replay} connector consumes them, the
+ *       {@code ReplayHeaderToTopic} SMT routes them back to {@code datastore.<table>}
+ *       using the headers, and the upsert succeeds &mdash; demonstrating successful
+ *       replay end-to-end. Their {@code id} is offset by
+ *       {@link #RECOVERABLE_ID_OFFSET} so replayed rows are immediately
+ *       identifiable in the destination tables
+ *       ({@code WHERE id >= 9_000_000_000_000}).</li>
+ * </ol>
+ *
+ * <p>Rates are layered: {@code ERROR_RATE} chooses good vs. failing; among failing
+ * records, {@code RECOVERABLE_RATE} chooses recoverable-DLQ vs. unrecoverable. With the
+ * defaults ({@code ERROR_RATE=0.3}, {@code RECOVERABLE_RATE=0.1}) the mix is roughly
+ * 70% good, 27% unrecoverable, 3% recoverable.
  */
 public class ErrorSimulator {
 
@@ -29,6 +54,25 @@ public class ErrorSimulator {
     private static final double ERROR_RATE = Double.parseDouble(System.getenv().getOrDefault("ERROR_RATE", "0.3"));
     private static final long INTERVAL_MS = Long.parseLong(System.getenv().getOrDefault("INTERVAL_MS", "5000"));
     private static final String ENVELOPE_FORMAT = System.getenv().getOrDefault("ENVELOPE_FORMAT", "flat");
+    /**
+     * Of the records selected to fail (per {@link #ERROR_RATE}), the fraction emitted
+     * as recoverable-DLQ records (well-formed Avro published directly to a DLQ topic).
+     * The remainder are unrecoverable garbage bytes sent to the primary {@code cdc.*}
+     * topics. Default {@code 0.1}.
+     */
+    private static final double RECOVERABLE_RATE = Double.parseDouble(System.getenv().getOrDefault("RECOVERABLE_RATE", "0.1"));
+
+    /**
+     * Offset added to the {@code id} of every recoverable-DLQ record so the resulting
+     * row in {@code datastore.<table>} is trivially identifiable as having come through
+     * the replay path.
+     *
+     * <p>Normal records use ids in {@code [1, 100_000)}; replayed rows therefore land
+     * at {@code >= 9_000_000_000_000} (well within the {@code bigint} range used by
+     * every datastore PK column). Filter with:
+     * <pre>{@code SELECT * FROM datastore.claims WHERE id >= 9000000000000;}</pre>
+     */
+    private static final long RECOVERABLE_ID_OFFSET = 9_000_000_000_000L;
 
     // Topic definitions grouped by connector
     private static final Map<String, List<String>> CONNECTOR_TOPICS = Map.of(
@@ -36,6 +80,22 @@ public class ErrorSimulator {
         "claims", List.of("cdc.claims", "cdc.claim_lines", "cdc.adjustments"),
         "providers", List.of("cdc.providers", "cdc.facilities", "cdc.networks")
     );
+
+    /**
+     * Reverse lookup: a {@code cdc.<table>} source topic to its owning connector group
+     * (e.g. {@code cdc.members} -> {@code eligibility}). Used to derive both the DLQ
+     * topic name ({@code dlq-jdbc-sink-<group>}) and the original connector name
+     * ({@code jdbc-sink-<group>}) when emitting recoverable-DLQ records, so the
+     * synthetic Connect error headers match what Kafka Connect would have written for
+     * a real failure on that topic.
+     */
+    private static final Map<String, String> TOPIC_TO_CONNECTOR = buildTopicToConnector();
+
+    private static Map<String, String> buildTopicToConnector() {
+        Map<String, String> m = new HashMap<>();
+        CONNECTOR_TOPICS.forEach((group, topics) -> topics.forEach(t -> m.put(t, group)));
+        return Map.copyOf(m);
+    }
 
     // Avro schemas for each topic
     private static final Map<String, Schema> SCHEMAS = new HashMap<>();
@@ -148,7 +208,8 @@ public class ErrorSimulator {
         log.info("Starting Error Simulator");
         log.info("Bootstrap Servers: {}", BOOTSTRAP_SERVERS);
         log.info("Schema Registry: {}", SCHEMA_REGISTRY_URL);
-        log.info("Batch Size: {}, Error Rate: {}, Interval: {}ms", BATCH_SIZE, ERROR_RATE, INTERVAL_MS);
+        log.info("Batch Size: {}, Error Rate: {}, Recoverable Rate: {}, Interval: {}ms",
+            BATCH_SIZE, ERROR_RATE, RECOVERABLE_RATE, INTERVAL_MS);
         log.info("Envelope Format: {}", ENVELOPE_FORMAT);
 
         // Wait for Schema Registry to be available
@@ -158,7 +219,9 @@ public class ErrorSimulator {
         EnvelopeStrategy strategy = createStrategy(ENVELOPE_FORMAT);
         strategy.initialize(SCHEMAS);
 
-        // All strategies emit Avro keys; only the value differs (good = Avro, bad = raw garbage bytes).
+        // The good and raw producers publish to the per-table cdc.* topics, where each
+        // topic carries exactly one schema, so the default TopicNameStrategy works fine
+        // and the JDBC sinks consume them with no extra config.
         Properties goodProps = new Properties();
         goodProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
         goodProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
@@ -175,8 +238,26 @@ public class ErrorSimulator {
         rawProps.put("schema.registry.url", SCHEMA_REGISTRY_URL);
         rawProps.put("auto.register.schemas", "true");
 
+        // Dedicated producer for the recoverable-DLQ path. We need TopicRecordNameStrategy
+        // here because this producer publishes records of *different* envelope schemas
+        // (e.g. Member / Coverage / Enrollment) to the *same* DLQ topic
+        // (dlq-jdbc-sink-eligibility). Under the default TopicNameStrategy those would
+        // collide on a single "<topic>-value" (or "<topic>-key") subject and SR would
+        // reject the second envelope as BACKWARD-incompatible. TopicRecordNameStrategy
+        // gives each record type its own subject so all three coexist on one topic.
+        //
+        // We deliberately keep this off goodProducer/rawProducer because the cdc.*
+        // topics are single-schema and the primary JDBC sinks consume them with the
+        // default TopicNameStrategy; mixing strategies there breaks the primary path
+        // (the sink looks up "cdc.<table>-key" and gets a 40401 from SR).
+        Properties dlqProps = new Properties();
+        dlqProps.putAll(goodProps);
+        dlqProps.put("key.subject.name.strategy", "io.confluent.kafka.serializers.subject.TopicRecordNameStrategy");
+        dlqProps.put("value.subject.name.strategy", "io.confluent.kafka.serializers.subject.TopicRecordNameStrategy");
+
         try (KafkaProducer<Object, Object> goodProducer = new KafkaProducer<>(goodProps);
-             KafkaProducer<Object, byte[]> rawProducer = new KafkaProducer<>(rawProps)) {
+             KafkaProducer<Object, byte[]> rawProducer = new KafkaProducer<>(rawProps);
+             KafkaProducer<Object, Object> dlqProducer = new KafkaProducer<>(dlqProps)) {
 
             List<String> allTopics = CONNECTOR_TOPICS.values().stream()
                 .flatMap(Collection::stream)
@@ -185,15 +266,24 @@ public class ErrorSimulator {
             while (true) {
                 for (int i = 0; i < BATCH_SIZE; i++) {
                     String topic = allTopics.get(ThreadLocalRandom.current().nextInt(allTopics.size()));
-                    boolean shouldFail = ThreadLocalRandom.current().nextDouble() < ERROR_RATE;
+                    // Three-way branch:
+                    //   p < (1 - ERROR_RATE)                              -> good record         (~70% default)
+                    //   p < (1 - ERROR_RATE) + ERROR_RATE*(1-RECOVERABLE) -> unrecoverable bytes  (~27% default)
+                    //   else                                              -> recoverable DLQ      (~ 3% default)
+                    double p = ThreadLocalRandom.current().nextDouble();
+                    double goodCutoff = 1.0 - ERROR_RATE;
+                    double unrecoverableCutoff = goodCutoff + ERROR_RATE * (1.0 - RECOVERABLE_RATE);
 
-                    if (shouldFail) {
+                    if (p < goodCutoff) {
+                        sendGoodRecord(goodProducer, topic, strategy);
+                    } else if (p < unrecoverableCutoff) {
                         sendBadRecord(rawProducer, topic, strategy);
                     } else {
-                        sendGoodRecord(goodProducer, topic, strategy);
+                        sendRecoverableDlqRecord(dlqProducer, topic, strategy);
                     }
                 }
-                log.info("Sent batch of {} messages (error rate: {}, format: {})", BATCH_SIZE, ERROR_RATE, ENVELOPE_FORMAT);
+                log.info("Sent batch of {} messages (error rate: {}, recoverable rate: {}, format: {})",
+                    BATCH_SIZE, ERROR_RATE, RECOVERABLE_RATE, ENVELOPE_FORMAT);
                 Thread.sleep(INTERVAL_MS);
             }
         }
@@ -232,6 +322,86 @@ public class ErrorSimulator {
                 log.error("Failed to send valid record to {}: {}", topic, exception.getMessage());
             } else {
                 log.debug("Sent valid record to {}[{}]@{}", metadata.topic(), metadata.partition(), metadata.offset());
+            }
+        });
+    }
+
+    /**
+     * Emits a well-formed Avro record directly to a DLQ topic with synthetic Connect
+     * error headers, simulating a record that the primary sink rejected for a transient
+     * downstream reason (e.g. DB outage, foreign-key lag) rather than a deserialization
+     * failure.
+     *
+     * <p>The headers attached are exactly the subset of {@code __connect.errors.*}
+     * headers that {@link com.medica.connect.smt.ReplayHeaderToTopic} (configured on
+     * {@code jdbc-sink-replay}) reads to reroute the record back to its original
+     * destination table:
+     * <ul>
+     *   <li>{@code __connect.errors.topic} &mdash; the original {@code cdc.<table>}
+     *       source topic. Used by the SMT to compute the destination as
+     *       {@code <schema>.<sourceTopic>}.</li>
+     *   <li>{@code __connect.errors.connector.name} &mdash; the original
+     *       {@code jdbc-sink-<group>} connector. Used by the SMT to look up the
+     *       Postgres schema in its {@code connector.schema.map}.</li>
+     * </ul>
+     * A few additional headers ({@code task.id}, {@code exception.class.name},
+     * {@code exception.message}, {@code timestamp}) are included for fidelity with what
+     * Kafka Connect would actually write — the SMT ignores them but they show up in
+     * kafka-ui / DLQman so the record looks like a real DLQ entry.
+     *
+     * <p>The downstream contract: {@code jdbc-sink-replay} consumes from
+     * {@code dlq-jdbc-sink-*}, the SMT rewrites the topic to e.g.
+     * {@code datastore.cdc.members}, the {@code RegexRouter} strips the {@code cdc.}
+     * prefix to {@code datastore.members}, and the Debezium sink upserts into that
+     * table — making this record observably "replayed".
+     *
+     * <p>The record's {@code id} is shifted by {@link #RECOVERABLE_ID_OFFSET}
+     * <em>before</em> the envelope is built, so both the Avro key (e.g. the Debezium
+     * structured {@code {id: long}}) and the value's {@code after.id} carry the
+     * sentinel. This makes replayed rows visually obvious and easy to filter:
+     * {@code WHERE id >= 9_000_000_000_000}.
+     */
+    private static void sendRecoverableDlqRecord(KafkaProducer<Object, Object> producer, String sourceTopic, EnvelopeStrategy strategy) {
+        String group = TOPIC_TO_CONNECTOR.get(sourceTopic);
+        if (group == null) {
+            log.warn("No connector mapping for topic '{}'; skipping recoverable DLQ record", sourceTopic);
+            return;
+        }
+        String dlqTopic = "dlq-jdbc-sink-" + group;
+        String connectorName = "jdbc-sink-" + group;
+
+        Schema schema = SCHEMAS.get(sourceTopic);
+        GenericRecord record = generateRecord(sourceTopic, schema);
+        // Stamp the id with the sentinel offset BEFORE handing the record to the
+        // envelope strategy. This way the Avro key (which strategies derive from id)
+        // and the value's id field both carry the sentinel, so the row in Postgres is
+        // unambiguously identifiable as a replayed record.
+        long replayedId = ((Long) record.get("id")) + RECOVERABLE_ID_OFFSET;
+        record.put("id", replayedId);
+        // Build the full envelope (key + value) as if it were going to the source topic,
+        // then re-target the ProducerRecord at the DLQ topic. Key/value bytes match what
+        // the primary sink would have seen, so the replay sink decodes them identically.
+        ProducerRecord<Object, Object> envelope = strategy.createRecord(sourceTopic, record);
+
+        ProducerRecord<Object, Object> dlqRecord = new ProducerRecord<>(
+            dlqTopic, null, envelope.key(), envelope.value());
+        Headers headers = dlqRecord.headers();
+        headers.add("__connect.errors.topic", sourceTopic.getBytes(StandardCharsets.UTF_8));
+        headers.add("__connect.errors.connector.name", connectorName.getBytes(StandardCharsets.UTF_8));
+        headers.add("__connect.errors.task.id", "0".getBytes(StandardCharsets.UTF_8));
+        headers.add("__connect.errors.exception.class.name",
+            "org.apache.kafka.connect.errors.RetriableException".getBytes(StandardCharsets.UTF_8));
+        headers.add("__connect.errors.exception.message",
+            "Simulated transient failure (recoverable)".getBytes(StandardCharsets.UTF_8));
+        headers.add("__connect.errors.timestamp",
+            Long.toString(System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8));
+
+        producer.send(dlqRecord, (metadata, exception) -> {
+            if (exception != null) {
+                log.error("Failed to send recoverable DLQ record to {}: {}", dlqTopic, exception.getMessage());
+            } else {
+                log.info("Sent RECOVERABLE record to {}[{}]@{} (replays as {}, id={})",
+                    metadata.topic(), metadata.partition(), metadata.offset(), sourceTopic, replayedId);
             }
         });
     }

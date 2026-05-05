@@ -13,7 +13,7 @@ USER root
 RUN confluent-hub install --no-prompt confluentinc/kafka-connect-jdbc:10.8.0
 
 # Install Debezium JDBC Sink Connector (used by the replay connector)
-RUN curl -L https://repo1.maven.org/maven2/io/debezium/debezium-connector-jdbc/2.7.3.Final/debezium-connector-jdbc-2.7.3.Final-plugin.tar.gz | \
+RUN curl -L https://repo1.maven.org/maven2/io/debezium/debezium-connector-jdbc/3.4.0.Final/debezium-connector-jdbc-3.4.0.Final-plugin.tar.gz | \
     tar -xzf - -C /usr/share/confluent-hub-components/
 
 # Copy PostgreSQL JDBC driver

@@ -152,7 +152,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       BATCH_SIZE: "20"
-      ERROR_RATE: "0.3"
+      ERROR_RATE: "0.5"
+      RECOVERABLE_RATE: "0.5"  # of failing records, fraction sent as recoverable Avro to DLQ topics
       INTERVAL_MS: "5000"
       ENVELOPE_FORMAT: "debezium"  # flat | debezium | goldengate
 
